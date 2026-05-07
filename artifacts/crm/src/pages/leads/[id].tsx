@@ -10,7 +10,7 @@ import {
   LeadStatus,
   getGetLeadQueryKey,
   getListNotesQueryKey,
-  getListFollowupsQueryKey
+  getListFollowupsQueryKey,
 } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
@@ -249,7 +249,7 @@ export default function LeadDetail() {
                   </div>
                   <div className="p-4 border-t border-border bg-slate-50/50 dark:bg-slate-900/50">
                     <Form {...noteForm}>
-                      <form onSubmit={noteForm.handleSubmit((v) => createNote.mutate({ data: { ...v, leadId } as any }))} className="flex gap-2">
+                      <form onSubmit={noteForm.handleSubmit((v) => createNote.mutate({ id: leadId, data: v }))} className="flex gap-2">
                         <FormField
                           control={noteForm.control}
                           name="content"
@@ -280,7 +280,7 @@ export default function LeadDetail() {
                         <div key={item.id} className={`flex items-start gap-3 p-3 rounded-lg border ${item.completed ? 'bg-slate-50/50 dark:bg-slate-900/50 opacity-60' : 'bg-white dark:bg-slate-950'}`}>
                           <Checkbox 
                             checked={item.completed} 
-                            onCheckedChange={(checked) => updateFollowup.mutate({ id: item.id, data: { completed: !!checked } })}
+                            onCheckedChange={(checked) => updateFollowup.mutate({ id: leadId, followupId: item.id, data: { completed: !!checked } })}
                             className="mt-1"
                           />
                           <div className="flex-1">
@@ -296,7 +296,7 @@ export default function LeadDetail() {
                   </div>
                   <div className="p-4 border-t border-border bg-slate-50/50 dark:bg-slate-900/50">
                     <Form {...followupForm}>
-                      <form onSubmit={followupForm.handleSubmit((v) => createFollowup.mutate({ data: { ...v, leadId } as any }))} className="flex gap-2">
+                      <form onSubmit={followupForm.handleSubmit((v) => createFollowup.mutate({ id: leadId, data: v }))} className="flex gap-2">
                         <FormField
                           control={followupForm.control}
                           name="description"

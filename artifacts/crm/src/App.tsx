@@ -41,9 +41,9 @@ function AppRouter() {
   );
 }
 
-function App() {
-  const queryClient = new QueryClient();
+const queryClient = new QueryClient();
 
+function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <ThemeProvider defaultTheme="light" storageKey="crm-theme">
