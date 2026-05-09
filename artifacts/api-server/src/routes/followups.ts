@@ -1,6 +1,5 @@
 import { Router, type IRouter } from "express";
-import { eq, asc, sql } from "drizzle-orm";
-import { db, followupsTable, activityTable } from "@workspace/db";
+import { FollowupModel, ActivityModel, LeadModel, getNextId } from "@workspace/db";
 import {
   CreateFollowupBody,
   UpdateFollowupBody,
@@ -20,12 +19,7 @@ router.get("/leads/:id/followups", requireAuth, async (req, res): Promise<void> 
     return;
   }
 
-  const followups = await db
-    .select()
-    .from(followupsTable)
-    .where(eq(followupsTable.leadId, params.data.id))
-    .orderBy(asc(followupsTable.dueDate));
-
+  const followups = await FollowupModel.find({ leadId: params.data.id }).sort({ dueDate: 1 }).lean();
   res.json(followups);
 });
 
@@ -42,27 +36,25 @@ router.post("/leads/:id/followups", requireAuth, async (req, res): Promise<void>
     return;
   }
 
-  const [followup] = await db
-    .insert(followupsTable)
-    .values({
-      leadId: params.data.id,
-      description: parsed.data.description,
-      dueDate: new Date(parsed.data.dueDate),
-    })
-    .returning();
-
-  const [leadRow] = await db
-    .select({ name: sql<string>`name` })
-    .from(sql`leads`)
-    .where(sql`id = ${params.data.id}`);
-
-  await db.insert(activityTable).values({
-    type: "followup_scheduled",
-    message: `Follow-up scheduled for "${leadRow?.name ?? "lead"}"`,
+  const id = await getNextId("followups");
+  const followup = await new FollowupModel({
+    id,
     leadId: params.data.id,
-  });
+    description: parsed.data.description,
+    dueDate: new Date(parsed.data.dueDate),
+  }).save();
+  const plain = followup.toObject();
 
-  res.status(201).json(followup);
+  const lead = await LeadModel.findOne({ id: params.data.id }, { name: 1 }).lean();
+
+  await new ActivityModel({
+    id: await getNextId("activity"),
+    type: "followup_scheduled",
+    message: `Follow-up scheduled for "${lead?.name ?? "lead"}"`,
+    leadId: params.data.id,
+  }).save();
+
+  res.status(201).json(plain);
 });
 
 router.patch("/leads/:id/followups/:followupId", requireAuth, async (req, res): Promise<void> => {
@@ -86,11 +78,11 @@ router.patch("/leads/:id/followups/:followupId", requireAuth, async (req, res): 
     updateData.completedAt = parsed.data.completed ? new Date() : null;
   }
 
-  const [followup] = await db
-    .update(followupsTable)
-    .set(updateData)
-    .where(eq(followupsTable.id, params.data.followupId))
-    .returning();
+  const followup = await FollowupModel.findOneAndUpdate(
+    { id: params.data.followupId },
+    { $set: updateData },
+    { new: true },
+  ).lean();
 
   if (!followup) {
     res.status(404).json({ error: "Not Found", message: "Follow-up not found" });
@@ -98,16 +90,13 @@ router.patch("/leads/:id/followups/:followupId", requireAuth, async (req, res): 
   }
 
   if (parsed.data.completed) {
-    const [leadRow] = await db
-      .select({ name: sql<string>`name` })
-      .from(sql`leads`)
-      .where(sql`id = ${params.data.id}`);
-
-    await db.insert(activityTable).values({
+    const lead = await LeadModel.findOne({ id: params.data.id }, { name: 1 }).lean();
+    await new ActivityModel({
+      id: await getNextId("activity"),
       type: "followup_completed",
-      message: `Follow-up completed for "${leadRow?.name ?? "lead"}"`,
+      message: `Follow-up completed for "${lead?.name ?? "lead"}"`,
       leadId: params.data.id,
-    });
+    }).save();
   }
 
   res.json(followup);
@@ -120,11 +109,7 @@ router.delete("/leads/:id/followups/:followupId", requireAuth, async (req, res):
     return;
   }
 
-  const [followup] = await db
-    .delete(followupsTable)
-    .where(eq(followupsTable.id, params.data.followupId))
-    .returning();
-
+  const followup = await FollowupModel.findOneAndDelete({ id: params.data.followupId }).lean();
   if (!followup) {
     res.status(404).json({ error: "Not Found", message: "Follow-up not found" });
     return;

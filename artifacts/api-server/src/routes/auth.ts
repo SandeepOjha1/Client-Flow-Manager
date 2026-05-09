@@ -1,7 +1,6 @@
 import { Router, type IRouter } from "express";
 import bcrypt from "bcryptjs";
-import { eq } from "drizzle-orm";
-import { db, usersTable } from "@workspace/db";
+import { UserModel, getNextId } from "@workspace/db";
 import { LoginBody, RegisterBody } from "@workspace/api-zod";
 import { signToken } from "../lib/jwt";
 import { requireAuth } from "../middlewares/auth";
@@ -16,7 +15,7 @@ router.post("/auth/login", async (req, res): Promise<void> => {
   }
 
   const { email, password } = parsed.data;
-  const [user] = await db.select().from(usersTable).where(eq(usersTable.email, email));
+  const user = await UserModel.findOne({ email }).lean();
 
   if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
     res.status(401).json({ error: "Unauthorized", message: "Invalid email or password" });
@@ -45,36 +44,32 @@ router.post("/auth/register", async (req, res): Promise<void> => {
 
   const { name, email, password } = parsed.data;
 
-  const [existing] = await db.select().from(usersTable).where(eq(usersTable.email, email));
+  const existing = await UserModel.findOne({ email }).lean();
   if (existing) {
     res.status(400).json({ error: "Bad Request", message: "Email already registered" });
     return;
   }
 
   const passwordHash = await bcrypt.hash(password, 12);
-  const [user] = await db
-    .insert(usersTable)
-    .values({ name, email, passwordHash, role: "admin" })
-    .returning();
+  const id = await getNextId("users");
+  const user = await new UserModel({ id, name, email, passwordHash, role: "admin" }).save();
+  const plain = user.toObject();
 
-  const token = signToken({ userId: user.id, email: user.email, role: user.role });
+  const token = signToken({ userId: plain.id, email: plain.email, role: plain.role });
   res.status(201).json({
     token,
     user: {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      createdAt: user.createdAt,
+      id: plain.id,
+      name: plain.name,
+      email: plain.email,
+      role: plain.role,
+      createdAt: plain.createdAt,
     },
   });
 });
 
 router.get("/auth/me", requireAuth, async (req, res): Promise<void> => {
-  const [user] = await db
-    .select()
-    .from(usersTable)
-    .where(eq(usersTable.id, req.user!.userId));
+  const user = await UserModel.findOne({ id: req.user!.userId }).lean();
 
   if (!user) {
     res.status(404).json({ error: "Not Found", message: "User not found" });

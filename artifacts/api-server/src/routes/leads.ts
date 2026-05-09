@@ -1,6 +1,5 @@
 import { Router, type IRouter } from "express";
-import { eq, ilike, and, count, sql, desc, asc } from "drizzle-orm";
-import { db, leadsTable, notesTable, followupsTable, activityTable } from "@workspace/db";
+import { LeadModel, NoteModel, FollowupModel, ActivityModel, getNextId } from "@workspace/db";
 import {
   ListLeadsQueryParams,
   CreateLeadBody,
@@ -25,36 +24,23 @@ router.get("/leads", requireAuth, async (req, res): Promise<void> => {
   const { page, limit, search, status, source, sortBy, sortOrder } = parsed.data;
   const offset = (page - 1) * limit;
 
-  const conditions = [];
+  const filter: Record<string, unknown> = {};
   if (search) {
-    conditions.push(
-      sql`(${ilike(leadsTable.name, `%${search}%`)} OR ${ilike(leadsTable.email, `%${search}%`)} OR ${ilike(leadsTable.company ?? leadsTable.company, `%${search}%`)})`
-    );
+    filter.$or = [
+      { name: { $regex: search, $options: "i" } },
+      { email: { $regex: search, $options: "i" } },
+      { company: { $regex: search, $options: "i" } },
+    ];
   }
-  if (status) conditions.push(eq(leadsTable.status, status));
-  if (source) conditions.push(eq(leadsTable.source, source));
+  if (status) filter.status = status;
+  if (source) filter.source = source;
 
-  const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+  const sortField = ["createdAt", "name", "email", "status"].includes(sortBy ?? "") ? sortBy : "createdAt";
+  const sortObj: Record<string, 1 | -1> = { [sortField!]: sortOrder === "asc" ? 1 : -1 };
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const orderMap: Record<string, any> = {
-    createdAt: leadsTable.createdAt,
-    name: leadsTable.name,
-    email: leadsTable.email,
-    status: leadsTable.status,
-  };
-  const orderCol = orderMap[sortBy] ?? leadsTable.createdAt;
-  const orderFn = sortOrder === "asc" ? asc : desc;
-
-  const [leadsRaw, [{ total }]] = await Promise.all([
-    db
-      .select()
-      .from(leadsTable)
-      .where(whereClause)
-      .orderBy(orderFn(orderCol))
-      .limit(limit)
-      .offset(offset),
-    db.select({ total: count() }).from(leadsTable).where(whereClause),
+  const [leadsRaw, total] = await Promise.all([
+    LeadModel.find(filter).sort(sortObj).skip(offset).limit(limit).lean(),
+    LeadModel.countDocuments(filter),
   ]);
 
   const leadIds = leadsRaw.map((l) => l.id);
@@ -62,19 +48,18 @@ router.get("/leads", requireAuth, async (req, res): Promise<void> => {
   let followupCounts: Record<number, number> = {};
 
   if (leadIds.length > 0) {
-    const noteCountRows = await db
-      .select({ leadId: notesTable.leadId, cnt: count() })
-      .from(notesTable)
-      .where(sql`${notesTable.leadId} = ANY(${sql.raw(`ARRAY[${leadIds.join(",")}]`)})`)
-      .groupBy(notesTable.leadId);
-    const followupCountRows = await db
-      .select({ leadId: followupsTable.leadId, cnt: count() })
-      .from(followupsTable)
-      .where(sql`${followupsTable.leadId} = ANY(${sql.raw(`ARRAY[${leadIds.join(",")}]`)})`)
-      .groupBy(followupsTable.leadId);
-
-    noteCounts = Object.fromEntries(noteCountRows.map((r) => [r.leadId, Number(r.cnt)]));
-    followupCounts = Object.fromEntries(followupCountRows.map((r) => [r.leadId, Number(r.cnt)]));
+    const [noteAgg, followupAgg] = await Promise.all([
+      NoteModel.aggregate([
+        { $match: { leadId: { $in: leadIds } } },
+        { $group: { _id: "$leadId", count: { $sum: 1 } } },
+      ]),
+      FollowupModel.aggregate([
+        { $match: { leadId: { $in: leadIds } } },
+        { $group: { _id: "$leadId", count: { $sum: 1 } } },
+      ]),
+    ]);
+    noteCounts = Object.fromEntries(noteAgg.map((r) => [r._id, r.count]));
+    followupCounts = Object.fromEntries(followupAgg.map((r) => [r._id, r.count]));
   }
 
   const leads = leadsRaw.map((l) => ({
@@ -83,13 +68,7 @@ router.get("/leads", requireAuth, async (req, res): Promise<void> => {
     followupsCount: followupCounts[l.id] ?? 0,
   }));
 
-  res.json({
-    leads,
-    total: Number(total),
-    page,
-    limit,
-    totalPages: Math.ceil(Number(total) / limit),
-  });
+  res.json({ leads, total, page, limit, totalPages: Math.ceil(total / limit) });
 });
 
 router.post("/leads", requireAuth, async (req, res): Promise<void> => {
@@ -99,18 +78,18 @@ router.post("/leads", requireAuth, async (req, res): Promise<void> => {
     return;
   }
 
-  const [lead] = await db
-    .insert(leadsTable)
-    .values({ ...parsed.data, status: parsed.data.status ?? "new" })
-    .returning();
+  const id = await getNextId("leads");
+  const lead = await new LeadModel({ id, ...parsed.data, status: parsed.data.status ?? "new" }).save();
+  const plain = lead.toObject();
 
-  await db.insert(activityTable).values({
+  await new ActivityModel({
+    id: await getNextId("activity"),
     type: "lead_created",
-    message: `New lead "${lead.name}" was added`,
-    leadId: lead.id,
-  });
+    message: `New lead "${plain.name}" was added`,
+    leadId: plain.id,
+  }).save();
 
-  res.status(201).json({ ...lead, notesCount: 0, followupsCount: 0 });
+  res.status(201).json({ ...plain, notesCount: 0, followupsCount: 0 });
 });
 
 router.get("/leads/:id", requireAuth, async (req, res): Promise<void> => {
@@ -120,42 +99,29 @@ router.get("/leads/:id", requireAuth, async (req, res): Promise<void> => {
     return;
   }
 
-  const [lead] = await db
-    .select()
-    .from(leadsTable)
-    .where(eq(leadsTable.id, params.data.id));
-
+  const lead = await LeadModel.findOne({ id: params.data.id }).lean();
   if (!lead) {
     res.status(404).json({ error: "Not Found", message: "Lead not found" });
     return;
   }
 
-  const [notes, followups, [{ notesCount }], [{ followupsCount }]] = await Promise.all([
-    db
-      .select({
-        id: notesTable.id,
-        leadId: notesTable.leadId,
-        content: notesTable.content,
-        authorId: notesTable.authorId,
-        authorName: sql<string>`(SELECT name FROM users WHERE id = ${notesTable.authorId})`,
-        createdAt: notesTable.createdAt,
-      })
-      .from(notesTable)
-      .where(eq(notesTable.leadId, params.data.id))
-      .orderBy(desc(notesTable.createdAt)),
-    db
-      .select()
-      .from(followupsTable)
-      .where(eq(followupsTable.leadId, params.data.id))
-      .orderBy(asc(followupsTable.dueDate)),
-    db.select({ notesCount: count() }).from(notesTable).where(eq(notesTable.leadId, params.data.id)),
-    db.select({ followupsCount: count() }).from(followupsTable).where(eq(followupsTable.leadId, params.data.id)),
+  const [notesRaw, followups] = await Promise.all([
+    NoteModel.find({ leadId: params.data.id }).sort({ createdAt: -1 }).lean(),
+    FollowupModel.find({ leadId: params.data.id }).sort({ dueDate: 1 }).lean(),
   ]);
+
+  const authorIds = [...new Set(notesRaw.map((n) => n.authorId))];
+  const authors = await import("@workspace/db").then(({ UserModel: U }) =>
+    U.find({ id: { $in: authorIds } }, { id: 1, name: 1 }).lean()
+  );
+  const authorMap = Object.fromEntries(authors.map((a) => [a.id, a.name]));
+
+  const notes = notesRaw.map((n) => ({ ...n, authorName: authorMap[n.authorId] ?? "" }));
 
   res.json({
     ...lead,
-    notesCount: Number(notesCount),
-    followupsCount: Number(followupsCount),
+    notesCount: notes.length,
+    followupsCount: followups.length,
     notes,
     followups,
   });
@@ -174,23 +140,23 @@ router.put("/leads/:id", requireAuth, async (req, res): Promise<void> => {
     return;
   }
 
-  const [lead] = await db
-    .update(leadsTable)
-    .set(parsed.data)
-    .where(eq(leadsTable.id, params.data.id))
-    .returning();
+  const lead = await LeadModel.findOneAndUpdate(
+    { id: params.data.id },
+    { $set: parsed.data },
+    { new: true },
+  ).lean();
 
   if (!lead) {
     res.status(404).json({ error: "Not Found", message: "Lead not found" });
     return;
   }
 
-  const [[{ notesCount }], [{ followupsCount }]] = await Promise.all([
-    db.select({ notesCount: count() }).from(notesTable).where(eq(notesTable.leadId, lead.id)),
-    db.select({ followupsCount: count() }).from(followupsTable).where(eq(followupsTable.leadId, lead.id)),
+  const [notesCount, followupsCount] = await Promise.all([
+    NoteModel.countDocuments({ leadId: lead.id }),
+    FollowupModel.countDocuments({ leadId: lead.id }),
   ]);
 
-  res.json({ ...lead, notesCount: Number(notesCount), followupsCount: Number(followupsCount) });
+  res.json({ ...lead, notesCount, followupsCount });
 });
 
 router.delete("/leads/:id", requireAuth, async (req, res): Promise<void> => {
@@ -200,15 +166,17 @@ router.delete("/leads/:id", requireAuth, async (req, res): Promise<void> => {
     return;
   }
 
-  const [lead] = await db
-    .delete(leadsTable)
-    .where(eq(leadsTable.id, params.data.id))
-    .returning();
-
+  const lead = await LeadModel.findOneAndDelete({ id: params.data.id }).lean();
   if (!lead) {
     res.status(404).json({ error: "Not Found", message: "Lead not found" });
     return;
   }
+
+  await Promise.all([
+    NoteModel.deleteMany({ leadId: params.data.id }),
+    FollowupModel.deleteMany({ leadId: params.data.id }),
+    ActivityModel.deleteMany({ leadId: params.data.id }),
+  ]);
 
   res.sendStatus(204);
 });
@@ -226,29 +194,30 @@ router.patch("/leads/:id/status", requireAuth, async (req, res): Promise<void> =
     return;
   }
 
-  const [lead] = await db
-    .update(leadsTable)
-    .set({ status: parsed.data.status })
-    .where(eq(leadsTable.id, params.data.id))
-    .returning();
+  const lead = await LeadModel.findOneAndUpdate(
+    { id: params.data.id },
+    { $set: { status: parsed.data.status } },
+    { new: true },
+  ).lean();
 
   if (!lead) {
     res.status(404).json({ error: "Not Found", message: "Lead not found" });
     return;
   }
 
-  await db.insert(activityTable).values({
+  await new ActivityModel({
+    id: await getNextId("activity"),
     type: "lead_status_changed",
     message: `"${lead.name}" status changed to ${parsed.data.status}`,
     leadId: lead.id,
-  });
+  }).save();
 
-  const [[{ notesCount }], [{ followupsCount }]] = await Promise.all([
-    db.select({ notesCount: count() }).from(notesTable).where(eq(notesTable.leadId, lead.id)),
-    db.select({ followupsCount: count() }).from(followupsTable).where(eq(followupsTable.leadId, lead.id)),
+  const [notesCount, followupsCount] = await Promise.all([
+    NoteModel.countDocuments({ leadId: lead.id }),
+    FollowupModel.countDocuments({ leadId: lead.id }),
   ]);
 
-  res.json({ ...lead, notesCount: Number(notesCount), followupsCount: Number(followupsCount) });
+  res.json({ ...lead, notesCount, followupsCount });
 });
 
 export default router;
